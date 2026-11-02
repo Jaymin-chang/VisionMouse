@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.spec
+*.exe
+!启动.vbs
+!启动.bat
+.vs/
+.vscode/
