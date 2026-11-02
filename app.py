@@ -28,7 +28,7 @@ except ImportError:
     np = None
 
 # —— 版本 & 更新源 ——
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 GITHUB_OWNER = "Jaymin-chang"
 GITHUB_REPO = "VisionMouse"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
