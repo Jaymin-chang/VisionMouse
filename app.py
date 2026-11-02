@@ -39,6 +39,28 @@ OCR_PS1 = os.path.join(APP_DIR, "ocr-lines.ps1")
 CREATE_NO_WINDOW = 0x08000000
 NEAR_BLACK = 5          # 灰度值 <= 5 视为纯黑，用来判断 PrintWindow 是否拿到画面
 
+# 用户配置持久化：exe 同目录下的 visionmouse_config.json
+_CONFIG_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else APP_DIR
+CONFIG_PATH = os.path.join(_CONFIG_DIR, "visionmouse_config.json")
+
+
+def load_user_config():
+    """读取上次保存的设置，文件不存在或损坏返回 {}。"""
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_user_config(cfg):
+    """把设置写回 JSON。失败不抛，以免影响主流程。"""
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
 
 def dpi_aware():
     """坐标和截图都走物理像素，175% 缩放下也不会错位。"""
@@ -328,6 +350,7 @@ class VisionMouseApp:
         self.recording = False
         self.looping = False
         self.stop_loop = threading.Event()
+        self.pause_loop = threading.Event()       # 暂停/继续开关：set=暂停中，clear=运行中
         self.live = False                   # 实时同步开关
         self.live_stop = threading.Event()
         self._live_sig = None               # 上一轮 OCR 结果签名，变了才刷新列表
@@ -460,6 +483,12 @@ class VisionMouseApp:
 
         self.loop_btn = ttk.Button(route_box, text="▶ 开始反复", command=self.toggle_loop)
         self.loop_btn.pack(fill="x", pady=(2, 0))
+        self.pause_btn = ttk.Button(route_box, text="⏸ 暂停", command=self.toggle_pause,
+                                    state="disabled")
+        self.pause_btn.pack(fill="x", pady=(2, 0))
+        self.restart_btn = ttk.Button(route_box, text="⟲ 从头重来", command=self.restart_loop,
+                                      state="disabled")
+        self.restart_btn.pack(fill="x", pady=(2, 0))
 
         track_box = ttk.LabelFrame(right, text="跑圈模板 · 地图锚定", padding=6)
         track_box.pack(fill="x", pady=(8, 0))
@@ -490,13 +519,11 @@ class VisionMouseApp:
         tr4 = ttk.Frame(track_box)
         tr4.pack(fill="x", pady=(4, 0))
         self.pace_on = tk.BooleanVar(value=True)
-        ttk.Checkbutton(tr4, text="按圈速", variable=self.pace_on).pack(side="left")
-        self.pace_min = tk.StringVar(value="4")
-        ttk.Entry(tr4, width=3, textvariable=self.pace_min).pack(side="left", padx=(2, 0))
-        ttk.Label(tr4, text="分").pack(side="left")
-        self.pace_sec = tk.StringVar(value="30")
-        ttk.Entry(tr4, width=4, textvariable=self.pace_sec).pack(side="left", padx=(2, 0))
-        ttk.Label(tr4, text="秒/圈").pack(side="left")
+        ttk.Checkbutton(tr4, text="按配速", variable=self.pace_on).pack(side="left")
+        self.pace_km = tk.StringVar(value="5.0")
+        ttk.Entry(tr4, width=5, textvariable=self.pace_km).pack(side="left", padx=(2, 0))
+        ttk.Label(tr4, text="分钟/公里（如 5.0 = 5分钟1公里）",
+                  foreground="#888").pack(side="left")
 
         self.anchor_var = tk.StringVar(value="锚点：未启用")
         ttk.Label(track_box, textvariable=self.anchor_var, foreground="#888").pack(anchor="w", pady=(4, 0))
@@ -511,8 +538,118 @@ class VisionMouseApp:
 
         self.refresh_windows()
 
+        # ── 加载用户配置 + 绑定自动保存 ────────────
+        self._load_user_config()
+        self._bind_autosave()
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+
         # 启动后后台静默检查一次更新（不弹窗，有新版本才通知）
         threading.Thread(target=self._check_update, kwargs={"silent": True}, daemon=True).start()
+
+    # ── 用户配置：保存 / 加载 ─────────────────────────────
+    def _collect_config(self):
+        """把所有需要持久化的字段装成 dict。"""
+        return {
+            "interval": self.interval.get().strip(),
+            "round_interval": self.round_interval.get().strip(),
+            "auto_confirm": bool(self.auto_confirm.get()),
+            "avoid_red": bool(self.avoid_red.get()),
+            "ppm": self.ppm_var.get().strip(),
+            "track": {
+                "len": self.len_var.get().strip(),
+                "wid": self.wid_var.get().strip(),
+                "ang": self.ang_var.get().strip(),
+                "n": self.n_var.get().strip(),
+            },
+            "pace": {
+                "on": bool(self.pace_on.get()),
+                "km": self.pace_km.get().strip(),
+            },
+            "avoid_rects": self.avoid_rects,              # list of 4-tuples
+            "skip_idx": sorted(self.skip_idx),           # list (JSON 不认 set)
+        }
+
+    def _apply_config(self, cfg):
+        """把 dict 里的值回填到 tk 变量。只覆盖字段确实存在的项。"""
+        def _set(var, val):
+            try:
+                var.set(val)
+            except (tk.TclError, ValueError, TypeError):
+                pass
+
+        if "interval" in cfg:
+            _set(self.interval, cfg["interval"])
+        if "round_interval" in cfg:
+            _set(self.round_interval, cfg["round_interval"])
+        if "auto_confirm" in cfg:
+            _set(self.auto_confirm, bool(cfg["auto_confirm"]))
+        if "avoid_red" in cfg:
+            _set(self.avoid_red, bool(cfg["avoid_red"]))
+        if "ppm" in cfg:
+            _set(self.ppm_var, cfg["ppm"])
+        tr = cfg.get("track", {})
+        if "len" in tr:
+            _set(self.len_var, tr["len"])
+        if "wid" in tr:
+            _set(self.wid_var, tr["wid"])
+        if "ang" in tr:
+            _set(self.ang_var, tr["ang"])
+        if "n" in tr:
+            _set(self.n_var, tr["n"])
+        pc = cfg.get("pace", {})
+        if "on" in pc:
+            _set(self.pace_on, bool(pc["on"]))
+        if "km" in pc:
+            _set(self.pace_km, pc["km"])
+        if "avoid_rects" in cfg and isinstance(cfg["avoid_rects"], list):
+            self.avoid_rects = [tuple(r) for r in cfg["avoid_rects"]]
+        if "skip_idx" in cfg and isinstance(cfg["skip_idx"], list):
+            self.skip_idx = set(int(i) for i in cfg["skip_idx"])
+        self._update_avoid_info()
+
+    def _load_user_config(self):
+        cfg = load_user_config()
+        if cfg:
+            self._apply_config(cfg)
+            self.log("已加载上次保存的设置")
+
+    def _bind_autosave(self):
+        """所有可编辑参数变化后自动写回 JSON（节流：最多 0.5 秒写一次）。"""
+        self._dirty = False
+        self._save_job = None
+
+        def _schedule_save(*_):
+            self._dirty = True
+            if self._save_job is None:
+                self._save_job = self.root.after(500, self._do_save)
+
+        self._schedule_save = _schedule_save
+
+        # 标量参数
+        for var in (self.interval, self.round_interval, self.ppm_var,
+                    self.len_var, self.wid_var, self.ang_var, self.n_var,
+                    self.pace_km):
+            var.trace_add("write", _schedule_save)
+        for var in (self.auto_confirm, self.avoid_red, self.pace_on):
+            var.trace_add("write", _schedule_save)
+
+    def _mark_dirty(self):
+        """手动改了 avoid_rects / skip_idx 后调用。"""
+        if hasattr(self, "_schedule_save"):
+            self._schedule_save()
+
+    def _do_save(self):
+        self._save_job = None
+        if getattr(self, "_dirty", False):
+            save_user_config(self._collect_config())
+            self._dirty = False
+
+    def _on_close(self):
+        self._do_save()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     # ── 关于 & 更新 ──────────────────────────────────────────
     def _open_url(self, url):
@@ -783,6 +920,7 @@ class VisionMouseApp:
         self.skip_idx = set()
         self._update_avoid_info()
         self.render()
+        self._mark_dirty()
         self.log("已清除全部作用范围与跳过点")
 
     def _update_avoid_info(self):
@@ -815,6 +953,7 @@ class VisionMouseApp:
                                  (x1 - sx) / iw, (y1 - sy) / ih))
         self._update_avoid_info()
         self.render()
+        self._mark_dirty()
         self.log("已加作用范围：窗口内 (%d,%d)-(%d,%d)" % (x0, y0, x1, y1))
 
     def on_canvas_click(self, event):
@@ -841,6 +980,7 @@ class VisionMouseApp:
                 self.skip_idx.symmetric_difference_update({best_i})
                 self._update_avoid_info()
                 self.render()
+                self._mark_dirty()
                 self.log("第 %d 点：%s" % (best_i + 1,
                                            "跳过" if best_i in self.skip_idx else "恢复参与跑圈"))
             return
@@ -1012,19 +1152,22 @@ class VisionMouseApp:
         滚动基准跟丢时才用记录原图做绝对对位兜底。偏移再大也量不出假峰。"""
         if np is None or img is None:
             return None
-        # 先跟滚动基准：每步只量一小段增量，离半屏周期很远，绝不会量出混叠的假峰
+        # 先跟滚动基准：最多重试 2 次（瞬时瓦片加载噪声经常只影响一帧，不该立刻判基准跟丢）
         if self.anchor_img is not None:
-            res = self._reg_shift(self.anchor_img, img)
-            if res is not None:
-                bx, by = self.anchor_base
-                dx, dy = bx + res[0], by + res[1]
-                if abs(res[0]) >= reanchor or abs(res[1]) >= reanchor:   # 走远了换基准
-                    self.anchor_img = self._gray_center(img)
-                    self.anchor_base = (dx, dy)
-                return (dx, dy, res[2])
-        # 滚动基准跟丢了（画面大变），才用记录原图做绝对对位兜底
+            for _attempt in range(2):
+                res = self._reg_shift(self.anchor_img, img)
+                if res is not None:
+                    bx, by = self.anchor_base
+                    dx, dy = bx + res[0], by + res[1]
+                    if abs(res[0]) >= reanchor or abs(res[1]) >= reanchor:   # 走远了换基准
+                        self.anchor_img = self._gray_center(img)
+                        self.anchor_base = (dx, dy)
+                    return (dx, dy, res[2])
+        # 滚动基准真的跟丢了（连续配准失败），才用记录原图做绝对对位兜底
+        # 兜底成功后重建滚动基准，但 anchor0_img 保持不动（保持"记录时绝对基准"语义）
         if self.anchor0_img is not None:
-            res = self._reg_shift(self.anchor0_img, img)
+            # anchor0_img 兜底用更严格的残差阈值（缩放后瓦片部分匹配的残差会更高）
+            res = self._reg_shift(self.anchor0_img, img, max_resid=6.0)
             if res is not None:
                 self.anchor_img = self._gray_center(img)
                 self.anchor_base = (res[0], res[1])
@@ -1177,24 +1320,26 @@ class VisionMouseApp:
             ppm = float(self.ppm_var.get())
             if straight <= 0 or radius <= 0 or ppm <= 0:
                 raise ValueError
-            if self.pace_on.get():                      # 按圈速：点数×点击间隔 + 每轮间隔 = 一圈
-                pace = int(self.pace_min.get() or 0) * 60 + float(self.pace_sec.get())
+            # 先算周长，配速换算要用
+            arc = math.pi * radius
+            perim = 2 * straight + 2 * arc
+            if self.pace_on.get():                      # 按配速：分钟/公里 → 一圈秒数 → 反推点数
+                pace_km = float(self.pace_km.get())
                 per = max(0.5, float(self.interval.get()))
                 round_iv = max(0.0, float(self.round_interval.get()))
-                if pace - round_iv <= 0:
+                pace = pace_km * (perim / 1000.0) * 60.0   # 分钟/公里 × (公里/圈) × 60秒/分
+                if pace - round_iv <= 0 or pace_km <= 0:
                     raise ValueError
                 n = max(6, int(round((pace - round_iv) / per)))
             else:
                 n = max(6, int(float(self.n_var.get())))
         except (ValueError, tk.TclError):
-            messagebox.showwarning("提示", "参数需为正数，且圈速须大于每轮间隔")
+            messagebox.showwarning("提示", "参数需为正数，且配速须大于每轮间隔")
             return
         iw, ih = self.img.size
         cx, cy = self.target[0] * iw, self.target[1] * ih
         ca, sa = math.cos(ang), math.sin(ang)
         half = straight / 2.0
-        arc = math.pi * radius
-        perim = 2 * straight + 2 * arc                  # 周长，点沿周长均布
         for i in range(n):
             d = perim * i / n
             if d < straight:                            # 上直道：向左
@@ -1218,8 +1363,8 @@ class VisionMouseApp:
         self.route_var.set("已记录 %d 个点" % len(self.route))
         extra = ""
         if self.pace_on.get():
-            extra = "（(%d分%g秒−轮间隔%g秒) ÷ 每点%.1f秒，一圈 = %d点×间隔+轮间隔）" % (
-                int(self.pace_min.get() or 0), float(self.pace_sec.get()), round_iv, per, n)
+            extra = "（配速 %s 分/公里，一圈 ≈ %d秒 − 轮间隔%g秒 ÷ 每点%.1f秒 → %d点）" % (
+                self.pace_km.get(), int(pace), round_iv, per, n)
         self.log("生成跑圈 %d 点%s：直道 %gm 半径 %gm 角度 %g° 中心 (%d,%d)" % (
             n, extra, straight, radius, math.degrees(ang), cx, cy))
         self.render()
@@ -1264,6 +1409,7 @@ class VisionMouseApp:
             self.render()
 
     def toggle_loop(self):
+        """反复执行：空闲时点=开始；运行中点=停止（彻底退出）。"""
         if self.looping:
             self.stop_loop.set()
             self.status.set("正在停止…")
@@ -1279,23 +1425,29 @@ class VisionMouseApp:
             round_iv = max(0.0, float(self.round_interval.get()))
             pace = 0.0
             if self.pace_on.get():
-                pace = int(self.pace_min.get() or 0) * 60 + float(self.pace_sec.get())
-                if pace <= 0:
+                pace_km = float(self.pace_km.get())
+                straight = float(self.len_var.get())
+                radius = float(self.wid_var.get())
+                perim = 2 * straight + 2 * math.pi * radius
+                pace = pace_km * (perim / 1000.0) * 60.0   # 分钟/公里 × 公里/圈 × 60
+                if pace <= 0 or pace_km <= 0:
                     raise ValueError
         except (ValueError, tk.TclError):
-            messagebox.showwarning("提示", "间隔/圈速请输入数字")
+            messagebox.showwarning("提示", "间隔/配速请输入正数")
             return
         self.looping = True
         self.busy = True
         self.stop_loop.clear()
+        self.pause_loop.clear()                 # 重来也先清掉暂停标记
         self._low_conf = 0                  # 连续锚定失败计数，≥3 熔断
         self.loop_btn.configure(text="■ 停止反复")
+        self.pause_btn.configure(text="⏸ 暂停", state="normal")
+        self.restart_btn.configure(state="normal")
         self.rec_btn.configure(state="disabled")
         self.click_btn.configure(state="disabled")
         if pace:
-            self.log("开始反复执行 %d 个点：%d点×间隔%.1f秒 + 轮间隔%.1f秒 ≈ 圈速 %d分%g秒" % (
-                len(self.route), len(self.route), interval, round_iv,
-                int(pace // 60), pace % 60))
+            self.log("开始反复执行 %d 个点：配速 %s 分/公里（一圈 ≈ %d秒），点击间隔 %.1f 秒，每轮间隔 %.1f 秒" % (
+                len(self.route), self.pace_km.get(), int(pace), interval, round_iv))
         else:
             self.log("开始反复执行 %d 个点，点击间隔 %.1f 秒，每轮间隔 %.1f 秒" % (
                 len(self.route), interval, round_iv))
@@ -1307,19 +1459,53 @@ class VisionMouseApp:
                                self.auto_confirm.get(), self.avoid_red.get()),
                          daemon=True).start()
 
+    def toggle_pause(self):
+        """暂停 / 继续切换。"""
+        if not self.looping:
+            return
+        if self.pause_loop.is_set():
+            self.pause_loop.clear()
+            self.pause_btn.configure(text="⏸ 暂停")
+            self.status.set("继续执行")
+            self.log("▶ 已继续（从第 %d 个点接着跑）" % (getattr(self, "_pause_idx", 0) + 1))
+        else:
+            self.pause_loop.set()
+            self.pause_btn.configure(text="▶ 继续")
+            self.status.set("已暂停 · 可继续或重来")
+            self.log("⏸ 已暂停（地图窗口仍在刷新；继续时从断点接着跑）")
+
+    def restart_loop(self):
+        """从头重来：杀掉当前 worker 再开一个新的。"""
+        if not self.looping:
+            return
+        self.stop_loop.set()                # 让当前 worker 退出
+        self.pause_loop.clear()
+        self.status.set("正在重来…")
+        self.log("⟲ 从头重来（重启反复执行）")
+        # 等 worker 退出再开新的（否则 stop_loop 残留影响下一轮）
+        threading.Thread(target=self._restart_worker, daemon=True).start()
+
+    def _restart_worker(self):
+        """后台等旧 worker 退出后，重新发起 toggle_loop。"""
+        for _ in range(50):                 # 最多等 5 秒
+            if not self.looping:
+                break
+            time.sleep(0.1)
+        self.root.after(0, self.toggle_loop)
+
     def _confirm_popup(self, hwnd, clicked=None):
         """点轨迹点后弹出的「确定」气泡：重新截图 OCR 找到并拟人点击。找不到就跳过。
-        气泡贴着钉出现，所以气泡与点钉位置的距离能反过来说明钉到底落在哪，写进 trace 好查账。"""
+        返回 (cx, cy) 表示实际点了确定按钮，返回 None 表示没找到/没点。"""
         import win32gui
         time.sleep(0.5)                     # 等气泡弹出
         img, rect = capture_window(hwnd)
         if img is None:
-            return
+            return None
         rows = ocr_lines(img)
         hit = next((r for r in rows if "确定" in r["clean"]), None)
         if not hit:
             self.root.after(0, self.log, "未识别到「确定」气泡，跳过确认")
-            return
+            return None
         r = win32gui.GetWindowRect(hwnd)
         cx = r[0] + hit["x"] + hit["w"] // 2
         cy = r[1] + hit["y"] + hit["h"] // 2
@@ -1328,35 +1514,65 @@ class VisionMouseApp:
                 cx - clicked[0], cy - clicked[1]))
         if not human_move((cx, cy)):
             self.stop_loop.set()
-            return
+            return None
         settle((cx, cy))
         left_click()
         self.root.after(0, self.log, "已自动点击「确定」(%d,%d)" % (cx, cy))
         time.sleep(0.3)
+        return (cx, cy)
 
     def _loop_worker(self, hwnd, interval, round_iv, pace=0.0,
                      auto_confirm=True, avoid_red=True):
         import win32gui
+        import win32api
         rounds = 0
         total = 0                       # 已点总次数，圈速模式用它排绝对时刻表
         t0 = time.time()
         stopped = "手动停止"
+        _last_mouse_goal = None         # 程序上一次把鼠标放到的目标坐标，用于检测用户手动接管
+        resume_idx = getattr(self, "_pause_idx", -1)   # -1 = 从头；≥0 = 从断点续
+        self._pause_idx = -1
         try:
             while not self.stop_loop.is_set():
+                # 暂停中循环：只等 resume / stop / restart
+                while self.pause_loop.is_set():
+                    if self.stop_loop.is_set():
+                        break
+                    time.sleep(0.1)
+                    continue
+                if self.stop_loop.is_set():
+                    break
                 rounds += 1
                 bring_front(hwnd)
                 n = len(self.route)
                 slot = interval if pace > 0 else 0.0   # 圈速模式：每点节奏=点击间隔，一圈=n×间隔+轮间隔
+                # 续跑逻辑：resume_idx 在「第一圈」生效，后续圈正常 0→n-1
+                this_round_start = max(0, resume_idx + 1) if rounds == 1 and resume_idx >= 0 else 0
+                resume_idx = -1                         # 第一圈续完就清
                 for idx, target in enumerate(list(self.route)):
+                    if rounds == 1 and idx < this_round_start:
+                        continue                        # 跳过暂停前已经点过的点
+                    # 每点前再查一次暂停/中止
+                    while self.pause_loop.is_set():
+                        self._pause_idx = idx           # 记住暂停位置
+                        if self.stop_loop.is_set():
+                            break
+                        # pause 期间窗口自己可能在刷新，resume 那一刻对一下：
+                        # map_shift 已经可能变了（pause 期间定时同步或 anchor 刷新）
+                        if self.pause_loop.wait(0.3):
+                            break
                     if self.stop_loop.is_set():
                         break
+                    # resume 那一刻重新对表：pause 期间地图挪了多少都扣出去
+                    if slot and idx == 0:
+                        t0, total = time.time(), 0
                     if esc_pressed():
                         stopped = "已按 ESC 中止"
                         self.stop_loop.set()
                         break
                     if slot:                    # 圈速模式：等排到该点的时刻，开销自动扣除
                         wait = t0 + total * slot - time.time()
-                        if wait > 0 and self.stop_loop.wait(wait):
+                        if wait > 0 and (self.pause_loop.wait(wait) or self.stop_loop.is_set()):
                             break
                     r = win32gui.GetWindowRect(hwnd)
                     w, h = r[2] - r[0], r[3] - r[1]
@@ -1364,35 +1580,42 @@ class VisionMouseApp:
                     img_now, waited = self._wait_still(hwnd)                # 等视野停住再量、再点
                     want_red = avoid_red or bool(self.avoid_rects) or bool(self.skip_idx)
                     marks = self._find_red_marks(img_now) if (want_red and img_now is not None) else None
-                    if self.anchor_labels or self.anchor_img is not None:   # 点击前现场校正地图偏移
-                        res = self._locate(img_now) if img_now is not None else None
-                        if res is None:                                 # 瓦片刚刷新时可能差一点，重截一次
-                            time.sleep(0.2)
-                            img_now, waited = self._wait_still(hwnd)
-                            if img_now is not None:
-                                res = self._locate(img_now)
-                                marks = self._find_red_marks(img_now)
-                        if res is None and self.anchor_img is None and self.anchor_labels:
-                            # 仅在没有图像锚定（无 numpy）时才退回文字地标：
-                            # 缩放后地标位置全变，OCR 兜底会算出错误偏移、把点带偏
-                            if img_now is not None:
-                                res = self._compute_shift(ocr_lines(img_now))
-                        if res:
-                            self._apply_shift(res[0], res[1], res[2])
-                            self._low_conf = 0
-                            self._trace("点%d 记录(%d,%d) 实测偏移%+.0f,%+.0f conf=%.0f 应用%+.0f,%+.0f 静帧%.2fs" % (
-                                idx + 1, int(target[0] * w), int(target[1] * h),
-                                res[0], res[1], res[2], self.map_shift[0], self.map_shift[1], waited))
-                        else:
-                            # 不再去点缩放按钮：视野跟不上就停下来等重截图，免得把地图越点越乱
-                            self._low_conf += 1
-                            skip = True                                     # 匹配失败绝不用旧偏移盲点
-                            if self._low_conf >= 3:                         # 连续失败 = 画面大变
-                                stopped = "地图视野变化且无法配准，已停止：请重新截图并生成连线"
-                                self.root.after(0, self.log, stopped)
-                                self.root.after(0, messagebox.showwarning, "已停止", stopped)
-                                self.stop_loop.set()
-                                break
+                    # ① 先尝试图像配准（始终试，哪怕 anchor_img 被重置了也有 anchor0_img 兜底）
+                    res = self._locate(img_now) if img_now is not None else None
+                    if res is None:                                         # 瓦片刚刷新时可能差一点，重截一次
+                        time.sleep(0.2)
+                        img_now, waited = self._wait_still(hwnd)
+                        if img_now is not None:
+                            res = self._locate(img_now)
+                            marks = self._find_red_marks(img_now)
+                    # ② 最后兜底：只有纯文字地标才用 OCR（anchor 全 None 才退回到这）
+                    if res is None and self.anchor_img is None and self.anchor0_img is None and self.anchor_labels:
+                        if img_now is not None:
+                            res = self._compute_shift(ocr_lines(img_now))
+                    # ③ 统一处理配准结果（不管 res 来自 _locate 还是 OCR 兜底）
+                    if res:
+                        self._apply_shift(res[0], res[1], res[2])
+                        self._low_conf = 0
+                        self._trace("点%d 记录(%d,%d) 实测偏移%+.0f,%+.0f conf=%.0f 应用%+.0f,%+.0f 静帧%.2fs" % (
+                            idx + 1, int(target[0] * w), int(target[1] * h),
+                            res[0], res[1], res[2], self.map_shift[0], self.map_shift[1], waited))
+                    else:
+                        # 配准彻底失败：绝不用旧偏移盲点，跳过这一个点
+                        self._low_conf += 1
+                        skip = True
+                        if self._low_conf >= 3:                             # 连续失败 = 画面大变，暂停等用户处理
+                            self._pause_idx = idx                           # 继续时从这一点接着
+                            _hint = ("地图视野变化且无法配准，已自动暂停（第 %d 点）。"
+                                     "调整完点「继续」从该点接着跑，或点「从头重来」。" % (idx + 1))
+                            # 关键：所有 UI 更新塞进同一个 after(0) lambda，保证主线程一次性处理完
+                            # 且彻底去掉 messagebox（模态弹窗会阻塞重绘，按钮变继续根本来不及显示）
+                            self.root.after(0, lambda idx=idx, hint=_hint: (
+                                self.pause_btn.configure(text="▶ 继续"),
+                                self.status.set("已暂停 · 配准失败"),
+                                self.log(hint),
+                            ))
+                            self.pause_loop.set()
+                            break
                     if skip:
                         continue
                     x = r[0] + int(target[0] * w) + int(self.map_shift[0])
@@ -1414,6 +1637,22 @@ class VisionMouseApp:
                         continue
                     self.root.after(0, self.status.set,
                                     "第 %d 轮 · 第 %d/%d 点" % (rounds, idx + 1, n))
+                    # 检测用户是否手动接管了鼠标：
+                    # 时机=上一个点 click 完登记的 _last_mouse_goal vs 当前鼠标位置
+                    # 阈值=100px（足够覆盖 settle 过冲和轨迹微抖，用户手动大范围拖动一定能抓到）
+                    cur = win32api.GetCursorPos()
+                    if _last_mouse_goal is not None:
+                        dx, dy = cur[0] - _last_mouse_goal[0], cur[1] - _last_mouse_goal[1]
+                        if dx * dx + dy * dy > 100 * 100:
+                            self._pause_idx = idx                   # 继续时从这一点接着
+                            _dev = int((dx * dx + dy * dy) ** 0.5)
+                            self.root.after(0, lambda idx=idx, dev=_dev: (
+                                self.pause_btn.configure(text="▶ 继续"),
+                                self.status.set("已暂停 · 用户手动接管鼠标"),
+                                self.log("⏸ 检测到用户手动移动鼠标（偏离 %dpx），自动暂停在第 %d 点" % (dev, idx + 1)),
+                            ))
+                            self.pause_loop.set()
+                            break
                     if not human_move((x, y)):
                         stopped = "已按 ESC 中止"
                         self.stop_loop.set()
@@ -1438,9 +1677,12 @@ class VisionMouseApp:
                                 x, y = nx, ny
                     left_click()
                     self._trace("  落钉于 (%d,%d)" % (x, y))
+                    _last_mouse_goal = (x, y)                      # click 完登记：鼠标应该停在这
                     total += 1
                     if auto_confirm:
-                        self._confirm_popup(hwnd, (x, y))
+                        btn_pos = self._confirm_popup(hwnd, (x, y))
+                        if btn_pos is not None:
+                            _last_mouse_goal = btn_pos          # 点了"确定"，鼠标停在按钮上
                     if not slot and self.stop_loop.wait(interval):
                         break
                 if self.stop_loop.is_set():
@@ -1460,7 +1702,10 @@ class VisionMouseApp:
         self.looping = False
         self.busy = False
         self.stop_loop.clear()
+        self.pause_loop.clear()
         self.loop_btn.configure(text="▶ 开始反复")
+        self.pause_btn.configure(text="⏸ 暂停", state="disabled")
+        self.restart_btn.configure(state="disabled")
         self.rec_btn.configure(state="normal")
         self.click_btn.configure(state="normal")
         msg = "反复执行结束（%s），共完成 %d 轮" % (stopped, rounds)
