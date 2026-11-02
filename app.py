@@ -28,7 +28,20 @@ except ImportError:
     np = None
 
 # —— 版本 & 更新源 ——
-__version__ = "1.0.1"
+# 从 version.txt 读（打包时 --add-data version.txt;. 带进 _MEIPASS），
+# 读不到（开发环境 / 文件被删）就用 fallback，保证不会崩
+def _read_version():
+    import sys
+    for base in (sys._MEIPASS if getattr(sys, "frozen", False) else APP_DIR,
+                 os.path.dirname(os.path.abspath(__file__))):
+        p = os.path.join(base, "version.txt")
+        if os.path.isfile(p):
+            try:
+                return open(p, encoding="utf-8").read().strip()
+            except Exception:
+                pass
+    return "1.0.0"
+__version__ = _read_version()
 GITHUB_OWNER = "Jaymin-chang"
 GITHUB_REPO = "VisionMouse"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
