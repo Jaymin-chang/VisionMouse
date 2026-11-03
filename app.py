@@ -27,6 +27,9 @@ try:
 except ImportError:
     np = None
 
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+OCR_PS1 = os.path.join(APP_DIR, "ocr-lines.ps1")
+
 # —— 版本 & 更新源 ——
 # 从 version.txt 读（打包时 --add-data version.txt;. 带进 _MEIPASS），
 # 读不到（开发环境 / 文件被删）就用 fallback，保证不会崩
@@ -47,8 +50,6 @@ GITHUB_REPO = "VisionMouse"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases"
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-OCR_PS1 = os.path.join(APP_DIR, "ocr-lines.ps1")
 CREATE_NO_WINDOW = 0x08000000
 NEAR_BLACK = 5          # 灰度值 <= 5 视为纯黑，用来判断 PrintWindow 是否拿到画面
 
